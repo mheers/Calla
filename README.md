@@ -79,9 +79,9 @@ First, please read the [Conduct Policy](CONDUCT.md).
 
 If you think you can be a polite person in accordance with the Conduct Policy, I'd be more than happy to add anyone who asks as a contributor. Just [email me](sean.mcbeth+gh@gmail.com) your profile info and a brief description of what you'd like to work on.
 
-#### Artwork
+New contributors are encouraged to setup time with me to meet over screenshare and discuss the project layout.
 
-Oh man, let's go nuts! I would love to see a wide variety of tilesets for rooms and avatars. Maybe customizable clothing and character features. 
+#### Artwork
 
 - You can use [Tiled](https://www.mapeditor.org/) to create a tilemap.
 - You can do multiple layers.
