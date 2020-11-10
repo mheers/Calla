@@ -10,10 +10,6 @@ export default [{
         sourcemap: true,
         file: "dist/calla.js"
     }, {
-        format: "es",
-        sourcemap: true,
-        file: "../Calla-Site/scripts/lib/calla.js"
-    }, {
         format: "cjs",
         sourcemap: true,
         file: "dist/calla.cjs.js"
