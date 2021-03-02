@@ -24,7 +24,7 @@ namespace Calla.Data
         {
             if (!optionsBuilder.IsConfigured)
             {
-                optionsBuilder.UseNpgsql("Name=ConnectionStrings:Calla");
+                optionsBuilder.UseNpgsql("Server=127.0.0.1;Port=5432;Database=calla;User Id=postgres;Password=password;");
             }
         }
 
