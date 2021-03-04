@@ -32,6 +32,13 @@ namespace Calla.Controllers
             return View();
         }
 
+        [Route("/Info")]
+        [ServiceFilter(typeof(LogHitsAttribute))]
+        public IActionResult Info()
+        {
+            return View();
+        }
+
         [Route("/ToS")]
         [ServiceFilter(typeof(LogHitsAttribute))]
         public IActionResult ToS()

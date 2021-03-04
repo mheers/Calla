@@ -140,7 +140,7 @@ export class ScreenPointerControls extends TypedEventBase {
         });
         element.addEventListener("pointerup", (evt) => {
             const pointer = new Pointer(evt), lastPointer = replacePointer(pointer);
-            pointer.buttons = lastPointer.buttons;
+            pointer.buttons = lastPointer?.buttons;
             dispatch(pointerUpEvt, pointer, 0);
             if (canClick) {
                 dispatch(clickEvt, pointer, 0);

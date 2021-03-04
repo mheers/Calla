@@ -36,9 +36,9 @@ namespace Calla.Controllers
 
         [HttpPost]
         [ResponseCache(Duration = 0, Location = ResponseCacheLocation.None, NoStore = true)]
-        public async Task<IActionResult> Rooms([FromBody] string roomName)
+        public async Task<IActionResult> Rooms([FromForm] string roomName)
         {
-            if(roomName is null)
+            if (roomName is null)
             {
                 return Error();
             }

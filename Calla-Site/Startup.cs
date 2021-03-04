@@ -67,7 +67,7 @@ namespace Calla
                 app.UseHsts();
             }
 
-            app.UseHttpsRedirection();
+            // app.UseHttpsRedirection();
 
             app.UseRouting()
                 .UseAuthentication()

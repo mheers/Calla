@@ -17,11 +17,16 @@
     function isNumber(obj) {
         return t(obj, "number", Number);
     }
+    /**
+     * Check a value to see if it is of a number type
+     * and is not the special NaN value.
+     */
+    function isGoodNumber(obj) {
+        return isNumber(obj)
+            && !Number.isNaN(obj);
+    }
     function isObject(obj) {
         return t(obj, "object", Object);
-    }
-    function isDate(obj) {
-        return obj instanceof Date;
     }
     function isArray(obj) {
         return obj instanceof Array;
@@ -32,17 +37,34 @@
     function assertNever(x, msg) {
         throw new Error((msg || "Unexpected object: ") + x);
     }
-    /**
-     * Check a value to see if it is of a number type
-     * and is not the special NaN value.
-     */
-    function isGoodNumber(obj) {
-        return isNumber(obj)
-            && !Number.isNaN(obj);
-    }
     function isNullOrUndefined(obj) {
         return obj === null
             || obj === undefined;
+    }
+    function isDefined(obj) {
+        return !isNullOrUndefined(obj);
+    }
+    function isArrayBufferView(obj) {
+        return obj instanceof Uint8Array
+            || obj instanceof Uint8ClampedArray
+            || obj instanceof Int8Array
+            || obj instanceof Uint16Array
+            || obj instanceof Int16Array
+            || obj instanceof Uint32Array
+            || obj instanceof Int32Array
+            || obj instanceof BigUint64Array
+            || obj instanceof BigInt64Array
+            || obj instanceof Float32Array
+            || obj instanceof Float64Array;
+    }
+    function isXHRBodyInit(obj) {
+        return isString(obj)
+            || obj instanceof Blob
+            || obj instanceof FormData
+            || obj instanceof ArrayBuffer
+            || obj instanceof Document
+            || isArrayBufferView(obj)
+            || obj instanceof ReadableStream;
     }
 
     /**
@@ -90,7 +112,7 @@
             const compareToKey = isNullOrUndefined(compareTo)
                 ? null
                 : keySelector(compareTo);
-            if (!isNullOrUndefined(compareToKey)
+            if (isDefined(compareToKey)
                 && itemKey < compareToKey) {
                 right = idx;
             }
@@ -671,17 +693,7 @@
         }
     }
 
-    function splitProgress(onProgress, weights) {
-        let subProgressWeights;
-        if (isNumber(weights)) {
-            subProgressWeights = new Array(weights);
-            for (let i = 0; i < subProgressWeights.length; ++i) {
-                subProgressWeights[i] = 1 / weights;
-            }
-        }
-        else {
-            subProgressWeights = weights;
-        }
+    function splitProgress(onProgress, subProgressWeights) {
         let weightTotal = 0;
         for (let i = 0; i < subProgressWeights.length; ++i) {
             weightTotal += subProgressWeights[i];
@@ -1516,11 +1528,7 @@
     function display(v) { return new Attr("display", v); }
 
     function hasNode(obj) {
-        return !isNullOrUndefined(obj)
-            && !isString(obj)
-            && !isNumber(obj)
-            && !isBoolean(obj)
-            && !isDate(obj)
+        return isObject(obj)
             && "element" in obj
             && obj.element instanceof Node;
     }
@@ -1580,303 +1588,245 @@
         document.body.appendChild(script);
     }
 
+    function dumpProgress(_soFar, _total, _message, _est) {
+        // do nothing
+    }
+
+    function normalizeMap(map, key, value) {
+        if (isNullOrUndefined(map)) {
+            map = new Map();
+        }
+        if (!map.has(key)) {
+            map.set(key, value);
+        }
+        return map;
+    }
+    function trackXHRProgress(name, xhr, target, onProgress, skipLoading, prevTask) {
+        return new Promise((resolve, reject) => {
+            let done = false;
+            let loaded = skipLoading;
+            function maybeResolve() {
+                if (loaded && done) {
+                    resolve();
+                }
+            }
+            async function onError() {
+                await prevTask;
+                reject(xhr.status);
+            }
+            target.addEventListener("loadstart", async () => {
+                await prevTask;
+                onProgress(0, 1, name);
+            });
+            target.addEventListener("progress", async (ev) => {
+                const evt = ev;
+                await prevTask;
+                onProgress(evt.loaded, Math.max(evt.loaded, evt.total), name);
+                if (evt.loaded === evt.total) {
+                    loaded = true;
+                    maybeResolve();
+                }
+            });
+            target.addEventListener("load", async () => {
+                await prevTask;
+                onProgress(1, 1, name);
+                done = true;
+                maybeResolve();
+            });
+            target.addEventListener("error", onError);
+            target.addEventListener("abort", onError);
+        });
+    }
+    function setXHRHeaders(xhr, method, path, xhrType, headers) {
+        xhr.open(method, path);
+        xhr.responseType = xhrType;
+        if (headers) {
+            for (const [key, value] of headers) {
+                xhr.setRequestHeader(key, value);
+            }
+        }
+    }
+    async function blobToBuffer(blob) {
+        const buffer = await blob.arrayBuffer();
+        return {
+            buffer,
+            contentType: blob.type
+        };
+    }
     class Fetcher {
-        normalizeOnProgress(headerMap, onProgress) {
+        normalizeOnProgress(headers, onProgress) {
             if (isNullOrUndefined(onProgress)
-                && headerMap instanceof Function) {
-                onProgress = headerMap;
+                && isFunction(headers)) {
+                onProgress = headers;
+            }
+            if (!isFunction(onProgress)) {
+                onProgress = dumpProgress;
             }
             return onProgress;
         }
-        normalizeHeaderMap(headerMap) {
-            if (headerMap instanceof Map) {
-                return headerMap;
+        normalizeHeaders(headers) {
+            if (headers instanceof Map) {
+                return headers;
             }
             return undefined;
         }
-        async getResponse(path, headerMap) {
-            const headers = {};
-            if (headerMap) {
-                for (const pair of headerMap.entries()) {
-                    headers[pair[0]] = pair[1];
+        async getXHR(path, xhrType, headers, onProgress) {
+            const xhr = new XMLHttpRequest();
+            const download = trackXHRProgress("downloading", xhr, xhr, onProgress, true, Promise.resolve());
+            setXHRHeaders(xhr, "GET", path, xhrType, headers);
+            xhr.send();
+            await download;
+            return xhr.response;
+        }
+        async postXHR(path, xhrType, obj, headers, onProgress) {
+            const [upProg, downProg] = splitProgress(onProgress, [1, 1]);
+            const xhr = new XMLHttpRequest();
+            const upload = trackXHRProgress("uploading", xhr, xhr.upload, upProg, false, Promise.resolve());
+            const download = trackXHRProgress("saving", xhr, xhr, downProg, true, upload);
+            let body = null;
+            if (isXHRBodyInit(obj)) {
+                body = obj;
+                if (obj instanceof Document) {
+                    headers = normalizeMap(headers, "Content-Type", "text/xml;charset=UTF-8");
+                }
+                else if (!(obj instanceof FormData)) {
+                    headers = normalizeMap(headers, "Content-Type", "application/octet-stream");
                 }
             }
-            return await this.readRequestResponse(path, fetch(path, {
-                headers
-            }));
-        }
-        async postObjectForResponse(path, obj, headerMap) {
-            const headers = {};
-            if (!(obj instanceof FormData)) {
-                headers["Content-Type"] = "application/json";
+            else if (isDefined(obj)) {
+                body = JSON.stringify(obj);
+                headers = normalizeMap(headers, "Content-Type", "application/json;charset=UTF-8");
             }
-            if (headerMap) {
-                for (const pair of headerMap.entries()) {
-                    headers[pair[0]] = pair[1];
-                }
-            }
-            const body = obj instanceof FormData
-                ? obj
-                : JSON.stringify(obj);
-            return await this.readRequestResponse(path, fetch(path, {
-                method: "POST",
-                headers,
-                body
-            }));
-        }
-        async readRequestResponse(path, request) {
-            const response = await request;
-            if (!response.ok) {
-                let message = response.statusText;
-                if (response.body) {
-                    message += " ";
-                    message += await response.text();
-                    message = message.trim();
-                }
-                throw new Error(`[${response.status}] - ${message} . Path ${path}`);
-            }
-            return response;
-        }
-        async readResponseBuffer(path, response, onProgress) {
-            const contentType = response.headers.get("Content-Type");
-            if (!contentType) {
-                throw new Error("Server did not provide a content type");
-            }
-            let contentLength = 1;
-            const contentLengthStr = response.headers.get("Content-Length");
-            if (!contentLengthStr) {
-                console.warn(`Server did not provide a content length header. Path: ${path}`);
+            setXHRHeaders(xhr, "POST", path, xhrType, headers);
+            if (isDefined(body)) {
+                xhr.send(body);
             }
             else {
-                contentLength = parseInt(contentLengthStr, 10);
-                if (!isGoodNumber(contentLength)) {
-                    console.warn(`Server did not provide a valid content length header. Value: ${contentLengthStr}, Path: ${path}`);
-                    contentLength = 1;
-                }
+                xhr.send();
             }
-            const hasContentLength = isGoodNumber(contentLength);
-            if (!hasContentLength) {
-                contentLength = 1;
-            }
-            if (!response.body) {
-                throw new Error("No response body!");
-            }
-            const reader = response.body.getReader();
-            const values = [];
-            let receivedLength = 0;
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) {
-                    break;
-                }
-                if (value) {
-                    values.push(value);
-                    receivedLength += value.length;
-                    if (onProgress) {
-                        onProgress(receivedLength, Math.max(receivedLength, contentLength), path);
-                    }
-                }
-            }
-            const buffer = new ArrayBuffer(receivedLength);
-            const array = new Uint8Array(buffer);
-            receivedLength = 0;
-            for (const value of values) {
-                array.set(value, receivedLength);
-                receivedLength += value.length;
-            }
-            if (onProgress) {
-                onProgress(1, 1, path);
-            }
-            return { buffer, contentType };
+            await upload;
+            await download;
+            return xhr.response;
         }
-        async _getBuffer(path, headerMap, onProgress) {
-            onProgress = this.normalizeOnProgress(headerMap, onProgress);
-            headerMap = this.normalizeHeaderMap(headerMap);
-            const response = await this.getResponse(path, headerMap);
-            return await this.readResponseBuffer(path, response, onProgress);
+        async _getBuffer(path, headers, onProgress) {
+            onProgress = this.normalizeOnProgress(headers, onProgress);
+            headers = this.normalizeHeaders(headers);
+            const blob = await this.getXHR(path, "blob", headers, onProgress);
+            return await blobToBuffer(blob);
         }
-        async getBuffer(path, headerMap, onProgress) {
-            return await this._getBuffer(path, headerMap, onProgress);
+        async getBuffer(path, headers, onProgress) {
+            return await this._getBuffer(path, headers, onProgress);
         }
-        async _postObjectForBuffer(path, obj, headerMap, onProgress) {
-            onProgress = this.normalizeOnProgress(headerMap, onProgress);
-            headerMap = this.normalizeHeaderMap(headerMap);
-            const response = await this.postObjectForResponse(path, obj, headerMap);
-            return await this.readResponseBuffer(path, response, onProgress);
+        async _postObjectForBuffer(path, obj, headers, onProgress) {
+            onProgress = this.normalizeOnProgress(headers, onProgress);
+            headers = this.normalizeHeaders(headers);
+            const blob = await this.postXHR(path, "blob", obj, headers, onProgress);
+            return await blobToBuffer(blob);
         }
-        async postObjectForBuffer(path, obj, headerMap, onProgress) {
-            return await this._postObjectForBuffer(path, obj, headerMap, onProgress);
+        async postObjectForBuffer(path, obj, headers, onProgress) {
+            return await this._postObjectForBuffer(path, obj, headers, onProgress);
         }
-        async _getBlob(path, headerMap, onProgress) {
-            onProgress = this.normalizeOnProgress(headerMap, onProgress);
-            headerMap = this.normalizeHeaderMap(headerMap);
-            const { buffer, contentType } = await this._getBuffer(path, headerMap, onProgress);
-            return new Blob([buffer], { type: contentType });
+        async _getBlob(path, headers, onProgress) {
+            onProgress = this.normalizeOnProgress(headers, onProgress);
+            headers = this.normalizeHeaders(headers);
+            return await this.getXHR(path, "blob", headers, onProgress);
         }
-        async getBlob(path, headerMap, onProgress) {
-            return this._getBlob(path, headerMap, onProgress);
+        async getBlob(path, headers, onProgress) {
+            return this._getBlob(path, headers, onProgress);
         }
-        async _postObjectForBlob(path, obj, headerMap, onProgress) {
-            onProgress = this.normalizeOnProgress(headerMap, onProgress);
-            headerMap = this.normalizeHeaderMap(headerMap);
-            const { buffer, contentType } = await this._postObjectForBuffer(path, obj, headerMap, onProgress);
-            return new Blob([buffer], { type: contentType });
+        async _postObjectForBlob(path, obj, headers, onProgress) {
+            onProgress = this.normalizeOnProgress(headers, onProgress);
+            headers = this.normalizeHeaders(headers);
+            return await this.postXHR(path, "blob", obj, headers, onProgress);
         }
-        async postObjectForBlob(path, obj, headerMap, onProgress) {
-            return this._postObjectForBlob(path, obj, headerMap, onProgress);
+        async postObjectForBlob(path, obj, headers, onProgress) {
+            return this._postObjectForBlob(path, obj, headers, onProgress);
         }
-        async _getFile(path, headerMap, onProgress) {
-            onProgress = this.normalizeOnProgress(headerMap, onProgress);
-            headerMap = this.normalizeHeaderMap(headerMap);
-            const blob = await this._getBlob(path, headerMap, onProgress);
+        async _getFile(path, headers, onProgress) {
+            onProgress = this.normalizeOnProgress(headers, onProgress);
+            headers = this.normalizeHeaders(headers);
+            const blob = await this._getBlob(path, headers, onProgress);
             return URL.createObjectURL(blob);
         }
-        async getFile(path, headerMap, onProgress) {
-            return await this._getFile(path, headerMap, onProgress);
+        async getFile(path, headers, onProgress) {
+            return await this._getFile(path, headers, onProgress);
         }
-        async _postObjectForFile(path, obj, headerMap, onProgress) {
-            onProgress = this.normalizeOnProgress(headerMap, onProgress);
-            headerMap = this.normalizeHeaderMap(headerMap);
-            const blob = await this._postObjectForBlob(path, obj, headerMap, onProgress);
+        async _postObjectForFile(path, obj, headers, onProgress) {
+            onProgress = this.normalizeOnProgress(headers, onProgress);
+            headers = this.normalizeHeaders(headers);
+            const blob = await this._postObjectForBlob(path, obj, headers, onProgress);
             return URL.createObjectURL(blob);
         }
-        async postObjectForFile(path, obj, headerMap, onProgress) {
-            return await this._postObjectForFile(path, obj, headerMap, onProgress);
+        async postObjectForFile(path, obj, headers, onProgress) {
+            return await this._postObjectForFile(path, obj, headers, onProgress);
         }
-        readBufferText(buffer) {
-            const decoder = new TextDecoder("utf-8");
-            const text = decoder.decode(buffer);
-            return text;
+        async _getText(path, headers, onProgress) {
+            onProgress = this.normalizeOnProgress(headers, onProgress);
+            headers = this.normalizeHeaders(headers);
+            return await this.getXHR(path, "text", headers, onProgress);
         }
-        async _getText(path, headerMap, onProgress) {
-            onProgress = this.normalizeOnProgress(headerMap, onProgress);
-            headerMap = this.normalizeHeaderMap(headerMap);
-            const { buffer } = await this._getBuffer(path, headerMap, onProgress);
-            return this.readBufferText(buffer);
+        async getText(path, headers, onProgress) {
+            return await this._getText(path, headers, onProgress);
         }
-        async getText(path, headerMap, onProgress) {
-            return await this._getText(path, headerMap, onProgress);
+        async _postObjectForText(path, obj, headers, onProgress) {
+            onProgress = this.normalizeOnProgress(headers, onProgress);
+            headers = this.normalizeHeaders(headers);
+            return this.postXHR(path, "text", obj, headers, onProgress);
         }
-        async _postObjectForText(path, obj, headerMap, onProgress) {
-            onProgress = this.normalizeOnProgress(headerMap, onProgress);
-            headerMap = this.normalizeHeaderMap(headerMap);
-            const { buffer } = await this._postObjectForBuffer(path, obj, headerMap, onProgress);
-            return this.readBufferText(buffer);
+        async postObjectForText(path, obj, headers, onProgress) {
+            return await this._postObjectForText(path, obj, headers, onProgress);
         }
-        async postObjectForText(path, obj, headerMap, onProgress) {
-            return await this._postObjectForText(path, obj, headerMap, onProgress);
-        }
-        setDefaultAcceptType(headerMap, type) {
-            if (!headerMap) {
-                headerMap = new Map();
+        setDefaultAcceptType(headers, type) {
+            if (!headers) {
+                headers = new Map();
             }
-            if (!headerMap.has("Accept")) {
-                headerMap.set("Accept", type);
+            if (!headers.has("Accept")) {
+                headers.set("Accept", type);
             }
-            return headerMap;
+            return headers;
         }
-        async _getObject(path, headerMap, onProgress) {
-            onProgress = this.normalizeOnProgress(headerMap, onProgress);
-            headerMap = this.normalizeHeaderMap(headerMap);
-            headerMap = this.setDefaultAcceptType(headerMap, "application/json");
-            const text = await this._getText(path, headerMap, onProgress);
-            return JSON.parse(text);
+        async _getObject(path, headers, onProgress) {
+            onProgress = this.normalizeOnProgress(headers, onProgress);
+            headers = this.normalizeHeaders(headers);
+            headers = this.setDefaultAcceptType(headers, "application/json");
+            return await this.getXHR(path, "json", headers, onProgress);
         }
-        async getObject(path, headerMap, onProgress) {
-            return await this._getObject(path, headerMap, onProgress);
+        async getObject(path, headers, onProgress) {
+            return await this._getObject(path, headers, onProgress);
         }
-        async _postObjectForObject(path, obj, headerMap, onProgress) {
-            onProgress = this.normalizeOnProgress(headerMap, onProgress);
-            headerMap = this.normalizeHeaderMap(headerMap);
-            headerMap = this.setDefaultAcceptType(headerMap, "application/json");
-            const text = await this._postObjectForText(path, obj, headerMap, onProgress);
-            return JSON.parse(text);
+        async _postObjectForObject(path, obj, headers, onProgress) {
+            onProgress = this.normalizeOnProgress(headers, onProgress);
+            headers = this.normalizeHeaders(headers);
+            return await this.postXHR(path, "json", obj, headers, onProgress);
         }
-        async postObjectForObject(path, obj, headerMap, onProgress) {
-            return await this._postObjectForObject(path, obj, headerMap, onProgress);
+        async postObjectForObject(path, obj, headers, onProgress) {
+            return await this._postObjectForObject(path, obj, headers, onProgress);
         }
-        async postObject(path, obj, headerMap, onProgress) {
-            onProgress = this.normalizeOnProgress(headerMap, onProgress);
-            headerMap = this.normalizeHeaderMap(headerMap);
-            if (onProgress instanceof Function) {
-                const [upProg, downProg] = splitProgress(onProgress, 2);
-                let headers = headerMap;
-                const xhr = new XMLHttpRequest();
-                function makeTask(name, target, onProgress, skipLoading, prevTask) {
-                    return new Promise((resolve, reject) => {
-                        let done = false;
-                        let loaded = skipLoading;
-                        function maybeResolve() {
-                            if (loaded && done) {
-                                resolve();
-                            }
-                        }
-                        async function onError() {
-                            await prevTask;
-                            reject(xhr.status);
-                        }
-                        target.addEventListener("loadstart", async () => {
-                            await prevTask;
-                            onProgress(0, 1, name);
-                        });
-                        target.addEventListener("progress", async (ev) => {
-                            const evt = ev;
-                            await prevTask;
-                            onProgress(evt.loaded, evt.total, name);
-                            if (evt.loaded === evt.total) {
-                                loaded = true;
-                                maybeResolve();
-                            }
-                        });
-                        target.addEventListener("load", async () => {
-                            await prevTask;
-                            onProgress(1, 1, name);
-                            done = true;
-                            maybeResolve();
-                        });
-                        target.addEventListener("error", onError);
-                        target.addEventListener("abort", onError);
-                    });
-                }
-                const upload = makeTask("uploading", xhr.upload, upProg, false, Promise.resolve());
-                const download = makeTask("saving", xhr, downProg, true, upload);
-                xhr.open("POST", path);
-                if (headers) {
-                    for (const [key, value] of headers) {
-                        xhr.setRequestHeader(key, value);
-                    }
-                }
-                if (obj instanceof FormData) {
-                    xhr.send(obj);
-                }
-                else {
-                    const json = JSON.stringify(obj);
-                    xhr.send(json);
-                }
-                await upload;
-                await download;
-            }
-            else {
-                await this.postObjectForResponse(path, obj, headerMap);
-            }
+        async _postObject(path, obj, headers, onProgress) {
+            onProgress = this.normalizeOnProgress(headers, onProgress);
+            headers = this.normalizeHeaders(headers);
+            await this.postXHR(path, "", obj, headers, onProgress);
         }
-        readTextXml(text) {
-            const parser = new DOMParser();
-            const xml = parser.parseFromString(text, "text/xml");
-            return xml.documentElement;
+        async postObject(path, obj, headers, onProgress) {
+            return await this._postObject(path, obj, headers, onProgress);
         }
-        async _getXml(path, headerMap, onProgress) {
-            onProgress = this.normalizeOnProgress(headerMap, onProgress);
-            headerMap = this.normalizeHeaderMap(headerMap);
-            const text = await this._getText(path, headerMap, onProgress);
-            return this.readTextXml(text);
+        async _getXml(path, headers, onProgress) {
+            onProgress = this.normalizeOnProgress(headers, onProgress);
+            headers = this.normalizeHeaders(headers);
+            const doc = await this.getXHR(path, "document", headers, onProgress);
+            return doc.documentElement;
         }
-        async getXml(path, headerMap, onProgress) {
-            return await this._getXml(path, headerMap, onProgress);
+        async getXml(path, headers, onProgress) {
+            return await this._getXml(path, headers, onProgress);
         }
-        async postObjectForXml(path, obj, headerMap, onProgress) {
-            const text = await this._postObjectForText(path, obj, headerMap, onProgress);
-            return this.readTextXml(text);
+        async _postObjectForXml(path, obj, headers, onProgress) {
+            onProgress = this.normalizeOnProgress(headers, onProgress);
+            headers = this.normalizeHeaders(headers);
+            const doc = await this.postXHR(path, "document", obj, headers, onProgress);
+            return doc.documentElement;
+        }
+        async postObjectForXml(path, obj, headers, onProgress) {
+            return await this._postObjectForXml(path, obj, headers, onProgress);
         }
         async loadScript(path, test, onProgress) {
             if (!test()) {
@@ -2007,8 +1957,8 @@
         return removed;
     }
     function isAudioNode(a) {
-        return !isNullOrUndefined(a)
-            && !isNullOrUndefined(a.context);
+        return isDefined(a)
+            && isDefined(a.context);
     }
     function isAudioParam(a) {
         return !isAudioNode(a);
@@ -2109,6 +2059,7 @@
             this.source = source;
             this.wasActive = false;
             this.analyser = null;
+            this.disposed = false;
             if (!isGoodNumber(bufferSize)
                 || bufferSize <= 0) {
                 throw new Error("Buffer size must be greater than 0");
@@ -2133,9 +2084,9 @@
             checkSource();
         }
         dispose() {
-            if (this.analyser) {
+            if (!this.disposed) {
                 disconnect(this.source.source, this.analyser);
-                this.analyser = null;
+                this.disposed = true;
             }
             this.buffer = null;
         }
@@ -2749,10 +2700,14 @@
             this.audioContext = audioContext;
             this.pose = new InterpolatedPose();
             this._spatializer = null;
+            this.disposed = false;
             this.volumeControl = audioContext.createGain();
         }
         dispose() {
-            this.spatializer = null;
+            if (!this.disposed) {
+                this.spatializer = null;
+                this.disposed = true;
+            }
         }
         get volume() {
             return this.volumeControl.gain.value;
@@ -2821,18 +2776,17 @@
         /**
          * Creates a spatializer that keeps track of position
          */
-        constructor(audioContext, input, output, destination) {
+        constructor(audioContext, destination) {
             super(audioContext);
-            this.input = input;
-            this.output = output;
             this.destination = destination;
-            if (this.output !== this.destination) {
-                connect(this.output, this.destination);
-            }
+            this.disposed = false;
         }
         dispose() {
-            if (this.output !== this.destination) {
-                disconnect(this.output, this.destination);
+            if (!this.disposed) {
+                if (this.output !== this.destination) {
+                    disconnect(this.output, this.destination);
+                }
+                this.disposed = true;
             }
         }
         copyAudioProperties(from) {
@@ -2850,7 +2804,8 @@
          * Creates a new "spatializer" that performs no panning. An anti-spatializer.
          */
         constructor(audioContext, destination) {
-            super(audioContext, destination, destination, destination);
+            super(audioContext, destination);
+            this.input = this.output = destination;
             Object.seal(this);
         }
         createNew() {
@@ -2868,10 +2823,8 @@
         /**
          * Creates a spatializer that keeps track of position
          */
-        constructor(audioContext, input, output) {
+        constructor(audioContext) {
             super(audioContext);
-            this.input = input;
-            this.output = output;
         }
         /**
          * Creates a spatialzer for an audio source.
@@ -2886,9 +2839,10 @@
 
     class NoSpatializationListener extends BaseListener {
         constructor(audioContext) {
+            super(audioContext);
             const gain = audioContext.createGain();
             gain.gain.value = 0.1;
-            super(audioContext, gain, gain);
+            this.input = this.output = gain;
         }
         /**
          * Do nothing
@@ -2906,15 +2860,19 @@
     class AudioDestination extends BaseAudioElement {
         constructor(audioContext, destination) {
             super(audioContext);
+            this.disposed2 = false;
             this._spatializedInput = audioContext.createGain();
             this._nonSpatializedInput = audioContext.createGain();
             connect(this._nonSpatializedInput, this.volumeControl);
             this.setDestination(destination);
         }
         dispose() {
-            this.setDestination(null);
-            disconnect(this._nonSpatializedInput, this.volumeControl);
-            super.dispose();
+            if (!this.disposed2) {
+                this.setDestination(null);
+                disconnect(this._nonSpatializedInput, this.volumeControl);
+                super.dispose();
+                this.disposed2 = true;
+            }
         }
         get spatialized() {
             return !(this.spatializer instanceof NoSpatializationListener);
@@ -4445,6 +4403,7 @@
         constructor(context, options) {
             this.channelGain = new Array();
             this.merger = null;
+            this.disposed = false;
             // Use defaults for undefined arguments.
             options = Object.assign({
                 ambisonicOrder: DEFAULT_AMBISONIC_ORDER,
@@ -4501,14 +4460,17 @@
             connect(this.merger, this.output);
         }
         dispose() {
-            for (let i = 0; i < this.channelGain.length; i++) {
-                disconnect(this.input, this.channelGain[i]);
-                if (this.merger) {
-                    disconnect(this.channelGain[i], this.merger, 0, i);
+            if (!this.disposed) {
+                for (let i = 0; i < this.channelGain.length; i++) {
+                    disconnect(this.input, this.channelGain[i]);
+                    if (this.merger) {
+                        disconnect(this.channelGain[i], this.merger, 0, i);
+                    }
                 }
-            }
-            if (this.merger) {
-                disconnect(this.merger, this.output);
+                if (this.merger) {
+                    disconnect(this.merger, this.output);
+                }
+                this.disposed = true;
             }
         }
         /**
@@ -4735,6 +4697,7 @@
          * @param hrirBufferList - An ordered-list of stereo AudioBuffers for convolution. (i.e. 2 stereo AudioBuffers for FOA)
          */
         constructor(context, hrirBufferList) {
+            this.disposed = false;
             this._context = context;
             this._active = false;
             this._isBufferLoaded = false;
@@ -4789,28 +4752,31 @@
             this.output = this._summingBus;
         }
         dispose() {
-            if (this._active) {
-                this.disable();
+            if (!this.disposed) {
+                if (this._active) {
+                    this.disable();
+                }
+                // Group W and Y, then Z and X.
+                disconnect(this._splitterWYZX, this._mergerWY, 0, 0);
+                disconnect(this._splitterWYZX, this._mergerWY, 1, 1);
+                disconnect(this._splitterWYZX, this._mergerZX, 2, 0);
+                disconnect(this._splitterWYZX, this._mergerZX, 3, 1);
+                // Create a network of convolvers using splitter/merger.
+                disconnect(this._mergerWY, this._convolverWY);
+                disconnect(this._mergerZX, this._convolverZX);
+                disconnect(this._convolverWY, this._splitterWY);
+                disconnect(this._convolverZX, this._splitterZX);
+                disconnect(this._splitterWY, this._mergerBinaural, 0, 0);
+                disconnect(this._splitterWY, this._mergerBinaural, 0, 1);
+                disconnect(this._splitterWY, this._mergerBinaural, 1, 0);
+                disconnect(this._splitterWY, this._inverter, 1, 0);
+                disconnect(this._inverter, this._mergerBinaural, 0, 1);
+                disconnect(this._splitterZX, this._mergerBinaural, 0, 0);
+                disconnect(this._splitterZX, this._mergerBinaural, 0, 1);
+                disconnect(this._splitterZX, this._mergerBinaural, 1, 0);
+                disconnect(this._splitterZX, this._mergerBinaural, 1, 1);
+                this.disposed = true;
             }
-            // Group W and Y, then Z and X.
-            disconnect(this._splitterWYZX, this._mergerWY, 0, 0);
-            disconnect(this._splitterWYZX, this._mergerWY, 1, 1);
-            disconnect(this._splitterWYZX, this._mergerZX, 2, 0);
-            disconnect(this._splitterWYZX, this._mergerZX, 3, 1);
-            // Create a network of convolvers using splitter/merger.
-            disconnect(this._mergerWY, this._convolverWY);
-            disconnect(this._mergerZX, this._convolverZX);
-            disconnect(this._convolverWY, this._splitterWY);
-            disconnect(this._convolverZX, this._splitterZX);
-            disconnect(this._splitterWY, this._mergerBinaural, 0, 0);
-            disconnect(this._splitterWY, this._mergerBinaural, 0, 1);
-            disconnect(this._splitterWY, this._mergerBinaural, 1, 0);
-            disconnect(this._splitterWY, this._inverter, 1, 0);
-            disconnect(this._inverter, this._mergerBinaural, 0, 1);
-            disconnect(this._splitterZX, this._mergerBinaural, 0, 0);
-            disconnect(this._splitterZX, this._mergerBinaural, 0, 1);
-            disconnect(this._splitterZX, this._mergerBinaural, 1, 0);
-            disconnect(this._splitterZX, this._mergerBinaural, 1, 1);
         }
         /**
          * Assigns 2 HRIR AudioBuffers to 2 convolvers: Note that we use 2 stereo
@@ -4877,6 +4843,7 @@
          * @param context - Associated BaseAudioContext.
          */
         constructor(context) {
+            this.disposed = false;
             this._context = context;
             this._splitter = this._context.createChannelSplitter(4);
             this._inX = this._context.createGain();
@@ -4945,44 +4912,47 @@
             this.output = this._merger;
         }
         dispose() {
-            // ACN channel ordering: [1, 2, 3] => [X, Y, Z]
-            // X (from channel 1)
-            disconnect(this._splitter, this._inX, 1);
-            // Y (from channel 2)
-            disconnect(this._splitter, this._inY, 2);
-            // Z (from channel 3)
-            disconnect(this._splitter, this._inZ, 3);
-            // Apply the rotation in the world space.
-            // |X|   | m0  m3  m6 |   | X * m0 + Y * m3 + Z * m6 |   | Xr |
-            // |Y| * | m1  m4  m7 | = | X * m1 + Y * m4 + Z * m7 | = | Yr |
-            // |Z|   | m2  m5  m8 |   | X * m2 + Y * m5 + Z * m8 |   | Zr |
-            disconnect(this._inX, this._m0);
-            disconnect(this._inX, this._m1);
-            disconnect(this._inX, this._m2);
-            disconnect(this._inY, this._m3);
-            disconnect(this._inY, this._m4);
-            disconnect(this._inY, this._m5);
-            disconnect(this._inZ, this._m6);
-            disconnect(this._inZ, this._m7);
-            disconnect(this._inZ, this._m8);
-            disconnect(this._m0, this._outX);
-            disconnect(this._m1, this._outY);
-            disconnect(this._m2, this._outZ);
-            disconnect(this._m3, this._outX);
-            disconnect(this._m4, this._outY);
-            disconnect(this._m5, this._outZ);
-            disconnect(this._m6, this._outX);
-            disconnect(this._m7, this._outY);
-            disconnect(this._m8, this._outZ);
-            // Transform 3: world space to audio space.
-            // W -> W (to channel 0)
-            disconnect(this._splitter, this._merger, 0, 0);
-            // X (to channel 1)
-            disconnect(this._outX, this._merger, 0, 1);
-            // Y (to channel 2)
-            disconnect(this._outY, this._merger, 0, 2);
-            // Z (to channel 3)
-            disconnect(this._outZ, this._merger, 0, 3);
+            if (!this.disposed) {
+                // ACN channel ordering: [1, 2, 3] => [X, Y, Z]
+                // X (from channel 1)
+                disconnect(this._splitter, this._inX, 1);
+                // Y (from channel 2)
+                disconnect(this._splitter, this._inY, 2);
+                // Z (from channel 3)
+                disconnect(this._splitter, this._inZ, 3);
+                // Apply the rotation in the world space.
+                // |X|   | m0  m3  m6 |   | X * m0 + Y * m3 + Z * m6 |   | Xr |
+                // |Y| * | m1  m4  m7 | = | X * m1 + Y * m4 + Z * m7 | = | Yr |
+                // |Z|   | m2  m5  m8 |   | X * m2 + Y * m5 + Z * m8 |   | Zr |
+                disconnect(this._inX, this._m0);
+                disconnect(this._inX, this._m1);
+                disconnect(this._inX, this._m2);
+                disconnect(this._inY, this._m3);
+                disconnect(this._inY, this._m4);
+                disconnect(this._inY, this._m5);
+                disconnect(this._inZ, this._m6);
+                disconnect(this._inZ, this._m7);
+                disconnect(this._inZ, this._m8);
+                disconnect(this._m0, this._outX);
+                disconnect(this._m1, this._outY);
+                disconnect(this._m2, this._outZ);
+                disconnect(this._m3, this._outX);
+                disconnect(this._m4, this._outY);
+                disconnect(this._m5, this._outZ);
+                disconnect(this._m6, this._outX);
+                disconnect(this._m7, this._outY);
+                disconnect(this._m8, this._outZ);
+                // Transform 3: world space to audio space.
+                // W -> W (to channel 0)
+                disconnect(this._splitter, this._merger, 0, 0);
+                // X (to channel 1)
+                disconnect(this._outX, this._merger, 0, 1);
+                // Y (to channel 2)
+                disconnect(this._outY, this._merger, 0, 2);
+                // Z (to channel 3)
+                disconnect(this._outZ, this._merger, 0, 3);
+                this.disposed = true;
+            }
         }
         /**
          * Updates the rotation matrix with 3x3 matrix.
@@ -5080,6 +5050,7 @@
          * @param channelMap - Routing destination array.
          */
         constructor(context, channelMap) {
+            this.disposed = false;
             this._context = context;
             this._splitter = this._context.createChannelSplitter(4);
             this._merger = this._context.createChannelMerger(4);
@@ -5105,10 +5076,13 @@
             connect(this._splitter, this._merger, 3, this._channelMap[3]);
         }
         dispose() {
-            disconnect(this._splitter, this._merger, 0, this._channelMap[0]);
-            disconnect(this._splitter, this._merger, 1, this._channelMap[1]);
-            disconnect(this._splitter, this._merger, 2, this._channelMap[2]);
-            disconnect(this._splitter, this._merger, 3, this._channelMap[3]);
+            if (!this.disposed) {
+                disconnect(this._splitter, this._merger, 0, this._channelMap[0]);
+                disconnect(this._splitter, this._merger, 1, this._channelMap[1]);
+                disconnect(this._splitter, this._merger, 2, this._channelMap[2]);
+                disconnect(this._splitter, this._merger, 3, this._channelMap[3]);
+                this.disposed = true;
+            }
         }
     }
 
@@ -5140,6 +5114,7 @@
          * Omnitone FOA renderer class. Uses the optimized convolution technique.
          */
         constructor(context, options) {
+            this.disposed = false;
             this.context = context;
             this.config = Object.assign({
                 channelMap: ChannelMap.Default,
@@ -5176,17 +5151,20 @@
             this.input.channelInterpretation = 'discrete';
         }
         dispose() {
-            if (this.getRenderingMode() === RenderingMode.Bypass) {
-                disconnect(this.bypass, this.output);
+            if (!this.disposed) {
+                if (this.getRenderingMode() === RenderingMode.Bypass) {
+                    disconnect(this.bypass, this.output);
+                }
+                disconnect(this.input, this.router.input);
+                disconnect(this.input, this.bypass);
+                disconnect(this.router.output, this.rotator.input);
+                disconnect(this.rotator.output, this.convolver.input);
+                disconnect(this.convolver.output, this.output);
+                this.convolver.dispose();
+                this.rotator.dispose();
+                this.router.dispose();
+                this.disposed = true;
             }
-            disconnect(this.input, this.router.input);
-            disconnect(this.input, this.bypass);
-            disconnect(this.router.output, this.rotator.input);
-            disconnect(this.rotator.output, this.convolver.input);
-            disconnect(this.convolver.output, this.output);
-            this.convolver.dispose();
-            this.rotator.dispose();
-            this.router.dispose();
         }
         /**
          * Initializes and loads the resource for the renderer.
@@ -5689,6 +5667,7 @@
          * @param ambisonicOrder - Ambisonic order.
          */
         constructor(context, ambisonicOrder) {
+            this.disposed = false;
             this._context = context;
             this._ambisonicOrder = ambisonicOrder;
             // We need to determine the number of channels K based on the ambisonic order
@@ -5730,28 +5709,31 @@
             this.output = this._merger;
         }
         dispose() {
-            for (let i = 1; i <= this._ambisonicOrder; i++) {
-                // Each ambisonic order requires a separate (2l + 1) x (2l + 1) rotation
-                // matrix. We compute the offset value as the first channel index of the
-                // current order where
-                //   k_last = l^2 + l + m,
-                // and m = -l
-                //   k_last = l^2
-                const orderOffset = i * i;
-                // Uses row-major indexing.
-                const rows = (2 * i + 1);
-                for (let j = 0; j < rows; j++) {
-                    const inputIndex = orderOffset + j;
-                    for (let k = 0; k < rows; k++) {
-                        const outputIndex = orderOffset + k;
-                        const matrixIndex = j * rows + k;
-                        disconnect(this._splitter, this._gainNodeMatrix[i - 1][matrixIndex], inputIndex);
-                        disconnect(this._gainNodeMatrix[i - 1][matrixIndex], this._merger, 0, outputIndex);
+            if (!this.disposed) {
+                for (let i = 1; i <= this._ambisonicOrder; i++) {
+                    // Each ambisonic order requires a separate (2l + 1) x (2l + 1) rotation
+                    // matrix. We compute the offset value as the first channel index of the
+                    // current order where
+                    //   k_last = l^2 + l + m,
+                    // and m = -l
+                    //   k_last = l^2
+                    const orderOffset = i * i;
+                    // Uses row-major indexing.
+                    const rows = (2 * i + 1);
+                    for (let j = 0; j < rows; j++) {
+                        const inputIndex = orderOffset + j;
+                        for (let k = 0; k < rows; k++) {
+                            const outputIndex = orderOffset + k;
+                            const matrixIndex = j * rows + k;
+                            disconnect(this._splitter, this._gainNodeMatrix[i - 1][matrixIndex], inputIndex);
+                            disconnect(this._gainNodeMatrix[i - 1][matrixIndex], this._merger, 0, outputIndex);
+                        }
                     }
                 }
+                // W-channel is not involved in rotation, skip straight to ouput.
+                disconnect(this._splitter, this._merger, 0, 0);
+                this.disposed = true;
             }
-            // W-channel is not involved in rotation, skip straight to ouput.
-            disconnect(this._splitter, this._merger, 0, 0);
         }
         /**
          * Updates the rotation matrix with 3x3 matrix.
@@ -5855,6 +5837,7 @@
          * Omnitone HOA renderer class. Uses the optimized convolution technique.
          */
         constructor(context, options) {
+            this.disposed = false;
             this.context = context;
             this.config = Object.assign({
                 ambisonicOrder: 3,
@@ -5895,15 +5878,18 @@
             this.input.channelInterpretation = 'discrete';
         }
         dispose() {
-            if (this.getRenderingMode() === RenderingMode.Bypass) {
-                disconnect(this.bypass, this.output);
+            if (!this.disposed) {
+                if (this.getRenderingMode() === RenderingMode.Bypass) {
+                    disconnect(this.bypass, this.output);
+                }
+                disconnect(this.input, this.rotator.input);
+                disconnect(this.input, this.bypass);
+                disconnect(this.rotator.output, this.convolver.input);
+                disconnect(this.convolver.output, this.output);
+                this.rotator.dispose();
+                this.convolver.dispose();
+                this.disposed = true;
             }
-            disconnect(this.input, this.rotator.input);
-            disconnect(this.input, this.bypass);
-            disconnect(this.rotator.output, this.convolver.input);
-            disconnect(this.convolver.output, this.output);
-            this.rotator.dispose();
-            this.convolver.dispose();
         }
         /**
          * Initializes and loads the resource for the renderer.
@@ -6027,6 +6013,7 @@
          * Listener model to spatialize sources in an environment.
          */
         constructor(context, options) {
+            this.disposed = false;
             // Use defaults for undefined arguments.
             options = Object.assign({
                 ambisonicOrder: DEFAULT_AMBISONIC_ORDER,
@@ -6072,13 +6059,16 @@
             this.setOrientation(options.forward, options.up);
         }
         dispose() {
-            // Connect pre-rotated soundfield to renderer.
-            disconnect(this.input, this.renderer.input);
-            // Connect rotated soundfield to ambisonic output.
-            disconnect(this.renderer.rotator.output, this.ambisonicOutput);
-            // Connect binaurally-rendered soundfield to binaural output.
-            disconnect(this.renderer.output, this.output);
-            this.renderer.dispose();
+            if (!this.disposed) {
+                // Connect pre-rotated soundfield to renderer.
+                disconnect(this.input, this.renderer.input);
+                // Connect rotated soundfield to ambisonic output.
+                disconnect(this.renderer.rotator.output, this.ambisonicOutput);
+                // Connect binaurally-rendered soundfield to binaural output.
+                disconnect(this.renderer.output, this.output);
+                this.renderer.dispose();
+                this.disposed = true;
+            }
         }
         getRenderingMode() {
             return this.renderer.getRenderingMode();
@@ -6139,6 +6129,7 @@
                 height: 0.5 * DEFAULT_ROOM_DIMENSIONS.height,
                 depth: 0.5 * DEFAULT_ROOM_DIMENSIONS.depth,
             };
+            this.disposed = false;
             if (options) {
                 if (isGoodNumber(options.speedOfSound)) {
                     this.speedOfSound = options.speedOfSound;
@@ -6224,32 +6215,35 @@
             this.setRoomProperties(options && options.dimensions, options && options.coefficients);
         }
         dispose() {
-            // Connect nodes.
-            disconnect(this.input, this.lowpass);
-            for (const property of Object.values(Direction)) {
-                const delay = this.delays[property];
-                const gain = this.gains[property];
-                disconnect(this.lowpass, delay);
-                disconnect(delay, gain);
-                disconnect(gain, this.merger, 0, 0);
+            if (!this.disposed) {
+                // Connect nodes.
+                disconnect(this.input, this.lowpass);
+                for (const property of Object.values(Direction)) {
+                    const delay = this.delays[property];
+                    const gain = this.gains[property];
+                    disconnect(this.lowpass, delay);
+                    disconnect(delay, gain);
+                    disconnect(gain, this.merger, 0, 0);
+                }
+                // Connect gains to ambisonic channel output.
+                // Left: [1 1 0 0]
+                // Right: [1 -1 0 0]
+                // Up: [1 0 1 0]
+                // Down: [1 0 -1 0]
+                // Front: [1 0 0 1]
+                // Back: [1 0 0 -1]
+                disconnect(this.gains.left, this.merger, 0, 1);
+                disconnect(this.gains.right, this.inverters.right);
+                disconnect(this.inverters.right, this.merger, 0, 1);
+                disconnect(this.gains.up, this.merger, 0, 2);
+                disconnect(this.gains.down, this.inverters.down);
+                disconnect(this.inverters.down, this.merger, 0, 2);
+                disconnect(this.gains.front, this.merger, 0, 3);
+                disconnect(this.gains.back, this.inverters.back);
+                disconnect(this.inverters.back, this.merger, 0, 3);
+                disconnect(this.merger, this.output);
+                this.disposed = true;
             }
-            // Connect gains to ambisonic channel output.
-            // Left: [1 1 0 0]
-            // Right: [1 -1 0 0]
-            // Up: [1 0 1 0]
-            // Down: [1 0 -1 0]
-            // Front: [1 0 0 1]
-            // Back: [1 0 0 -1]
-            disconnect(this.gains.left, this.merger, 0, 1);
-            disconnect(this.gains.right, this.inverters.right);
-            disconnect(this.inverters.right, this.merger, 0, 1);
-            disconnect(this.gains.up, this.merger, 0, 2);
-            disconnect(this.gains.down, this.inverters.down);
-            disconnect(this.inverters.down, this.merger, 0, 2);
-            disconnect(this.gains.front, this.merger, 0, 3);
-            disconnect(this.gains.back, this.inverters.back);
-            disconnect(this.inverters.back, this.merger, 0, 3);
-            disconnect(this.merger, this.output);
         }
         /**
          * Set the room's properties which determines the characteristics of
@@ -6349,6 +6343,7 @@
         * Late-reflections reverberation filter for Ambisonic content.
         */
         constructor(context, options) {
+            this.disposed = false;
             // Use defaults for undefined arguments.
             options = Object.assign({
                 durations: DEFAULT_REVERB_DURATIONS.slice(),
@@ -6379,9 +6374,12 @@
             this.setDurations(options.durations);
         }
         dispose() {
-            disconnect(this.input, this.predelay);
-            disconnect(this.predelay, this.convolver);
-            disconnect(this.convolver, this.output);
+            if (!this.disposed) {
+                disconnect(this.input, this.predelay);
+                disconnect(this.predelay, this.convolver);
+                disconnect(this.convolver, this.output);
+                this.disposed = true;
+            }
         }
         /**
          * Re-compute a new impulse response by providing Multiband RT60 durations.
@@ -7114,6 +7112,7 @@
          * Options for constructing a new ResonanceAudio scene.
          */
         constructor(context, options) {
+            this.disposed = false;
             // Use defaults for undefined arguments.
             options = Object.assign({
                 ambisonicOrder: DEFAULT_AMBISONIC_ORDER,
@@ -7158,9 +7157,12 @@
             this.listener.setRenderingMode(mode);
         }
         dispose() {
-            disconnect(this.room.output, this.listener.input);
-            disconnect(this.listener.output, this.output);
-            disconnect(this.listener.ambisonicOutput, this.ambisonicOutput);
+            if (!this.disposed) {
+                disconnect(this.room.output, this.listener.input);
+                disconnect(this.listener.output, this.output);
+                disconnect(this.listener.ambisonicOutput, this.ambisonicOutput);
+                this.disposed = true;
+            }
         }
         /**
          * Create a new source for the scene.
@@ -7236,10 +7238,12 @@
          * Creates a new spatializer that uses Google's Resonance Audio library.
          */
         constructor(audioContext, destination, res) {
-            const resNode = res.createSource(undefined);
-            super(audioContext, resNode.input, resNode.output, destination);
+            super(audioContext, destination);
             this.resScene = res;
-            this.resNode = resNode;
+            this.resNode = res.createSource(undefined);
+            this.input = this.resNode.input;
+            this.output = this.resNode.output;
+            connect(this.output, this.destination);
             Object.seal(this);
         }
         createNew() {
@@ -7281,6 +7285,8 @@
          * Creates a new audio positioner that uses Google's Resonance Audio library
          */
         constructor(audioContext) {
+            super(audioContext);
+            this.disposed = false;
             const scene = new ResonanceAudio(audioContext, {
                 ambisonicOrder: 1,
                 renderingMode: RenderingMode.Bypass
@@ -7297,16 +7303,19 @@
                 [Direction.Down]: Material.Grass,
                 [Direction.Up]: Material.Transparent,
             });
-            super(audioContext, scene.listener.input, scene.output);
+            this.input = scene.listener.input;
+            this.output = scene.output;
             this.scene = scene;
             Object.seal(this);
         }
         dispose() {
-            if (this.scene) {
-                this.scene.dispose();
-                this.scene = null;
+            if (!this.disposed) {
+                if (this.scene) {
+                    this.scene.dispose();
+                }
+                super.dispose();
+                this.disposed = true;
             }
-            super.dispose();
         }
         /**
          * Performs the spatialization operation for the audio source's latest location.
@@ -7335,10 +7344,12 @@
          * Creates a new spatializer that performs no panning, only distance-based volume scaling
          */
         constructor(audioContext, destination, listener) {
+            super(audioContext, destination);
             const gain = audioContext.createGain();
-            super(audioContext, gain, gain, destination);
+            this.input = this.output = gain;
             this.gain = gain;
             this.listener = listener;
+            connect(this.output, this.destination);
             Object.seal(this);
         }
         createNew() {
@@ -7365,8 +7376,9 @@
          * Creates a new positioner that uses WebAudio's playback dependent time progression.
          */
         constructor(audioContext) {
+            super(audioContext);
             const gain = audioContext.createGain();
-            super(audioContext, gain, gain);
+            this.input = this.output = gain;
             this.pose = new Pose();
         }
         /**
@@ -7397,14 +7409,14 @@
          * @param audioContext - the output WebAudio context
          */
         constructor(audioContext, destination) {
-            const panner = audioContext.createPanner();
-            super(audioContext, panner, panner, destination);
-            this.panner = panner;
+            super(audioContext, destination);
+            this.panner = audioContext.createPanner();
             this.panner.panningModel = "HRTF";
             this.panner.distanceModel = "inverse";
             this.panner.coneInnerAngle = 360;
             this.panner.coneOuterAngle = 0;
             this.panner.coneOuterGain = 0;
+            connect(this.output, this.destination);
         }
         copyAudioProperties(from) {
             super.copyAudioProperties(from);
@@ -7464,14 +7476,19 @@
          * Creates a new spatializer that uses WebAudio's PannerNode.
          */
         constructor(audioContext) {
+            super(audioContext);
+            this.disposed2 = false;
             const gain = audioContext.createGain();
+            this.input = this.output = gain;
             gain.gain.value = 0.75;
-            super(audioContext, gain, gain);
             this.listener = audioContext.listener;
         }
         dispose() {
-            this.listener = null;
-            super.dispose();
+            if (!this.disposed2) {
+                this.listener = null;
+                super.dispose();
+                this.disposed2 = true;
+            }
         }
     }
 
@@ -7574,10 +7591,14 @@
         constructor(id, audioContext) {
             super(audioContext);
             this.id = id;
+            this.disposed2 = false;
         }
         dispose() {
-            this.source = null;
-            super.dispose();
+            if (!this.disposed2) {
+                this.source = null;
+                super.dispose();
+                this.disposed2 = true;
+            }
         }
         get spatialized() {
             return !(this.spatializer instanceof NoSpatializationNode);
@@ -7616,6 +7637,7 @@
         constructor(id, audioContext, source, spatializer) {
             super(id, audioContext, source, spatializer);
             this.isPlaying = false;
+            this.disposed3 = false;
         }
         async play() {
             this.source.start();
@@ -7626,8 +7648,11 @@
             this.source.stop();
         }
         dispose() {
-            this.stop();
-            super.dispose();
+            if (!this.disposed3) {
+                this.stop();
+                super.dispose();
+                this.disposed3 = true;
+            }
         }
     }
 
@@ -7636,6 +7661,7 @@
             super(id, audioContext, source, spatializer);
             this.counter = 0;
             this.playingSources = new Array();
+            this.disposed3 = false;
         }
         connectSpatializer() {
             // do nothing, this node doesn't play on its own
@@ -7675,8 +7701,11 @@
             arrayClear(this.playingSources);
         }
         dispose() {
-            this.stop();
-            super.dispose();
+            if (!this.disposed3) {
+                this.stop();
+                super.dispose();
+                this.disposed3 = true;
+            }
         }
     }
 
@@ -7684,6 +7713,7 @@
         constructor(id, audioContext, source, spatializer) {
             super(id, audioContext);
             this.isPlaying = false;
+            this.disposed3 = false;
             this.source = source;
             this.spatializer = spatializer;
         }
@@ -7701,10 +7731,13 @@
             this.isPlaying = false;
         }
         dispose() {
-            if (this.source.mediaElement.parentElement) {
-                this.source.mediaElement.parentElement.removeChild(this.source.mediaElement);
+            if (!this.disposed3) {
+                if (this.source.mediaElement.parentElement) {
+                    this.source.mediaElement.parentElement.removeChild(this.source.mediaElement);
+                }
+                super.dispose();
+                this.disposed3 = false;
             }
-            super.dispose();
         }
     }
 
@@ -8107,6 +8140,7 @@
                 sources.delete(id);
                 source.dispose();
             }
+            return source;
         }
         /**
          * Remove a user from audio processing.
@@ -8120,7 +8154,7 @@
          * Remove an audio clip from audio processing.
          **/
         removeClip(id) {
-            this.removeSource(this.clips, id);
+            return this.removeSource(this.clips, id);
         }
         createSourceFromStream(stream) {
             if (useTrackSource) {
@@ -8358,6 +8392,7 @@
             this._meta = _meta;
             this.isAudioMuted = null;
             this.isVideoMuted = null;
+            this.disposed = false;
             const fwd = this.dispatchEvent.bind(this);
             this._tele.addEventListener("serverConnected", fwd);
             this._tele.addEventListener("serverDisconnected", fwd);
@@ -8493,8 +8528,11 @@
             return await this._tele.getVideoInputDevices(filterDuplicates);
         }
         dispose() {
-            this.leave();
-            this.disconnect();
+            if (!this.disposed) {
+                this.leave();
+                this.disconnect();
+                this.disposed = true;
+            }
         }
         get offsetRadius() {
             return this.audio.offsetRadius;
@@ -8624,7 +8662,7 @@
             let f = null;
             let a = null;
             let p = null;
-            if (!isNullOrUndefined(fetcher)
+            if (isDefined(fetcher)
                 && !(fetcher instanceof AudioManager)
                 && !isFunction(fetcher)) {
                 f = fetcher;
@@ -8635,7 +8673,7 @@
             if (fetcher instanceof AudioManager) {
                 a = fetcher;
             }
-            else if (!isNullOrUndefined(audio)
+            else if (isDefined(audio)
                 && !isFunction(audio)) {
                 a = audio;
             }
@@ -8658,7 +8696,8 @@
         }
     }
 
-    const jQueryPath = "https://cdnjs.cloudflare.com/ajax/libs/jquery/3.5.1/jquery.min.js";
+    const jQueryPath =
+        "https://cdnjs.cloudflare.com/ajax/libs/jquery/3.5.1/jquery.min.js";
     class BaseJitsiClientLoader extends BaseClientLoader {
         constructor(host, bridgeHost, bridgeMUC) {
             super();
@@ -8670,21 +8709,38 @@
         async _load(fetcher, onProgress) {
             if (!this.loaded) {
                 console.info("Connecting to:", this.host);
-                const progs = splitProgress(onProgress, 2);
-                await fetcher.loadScript(jQueryPath, () => "jQuery" in globalThis, progs.shift());
-                await fetcher.loadScript(`https://${this.host}/libs/lib-jitsi-meet.min.js`, () => "JitsiMeetJS" in globalThis, progs.shift());
+                const progs = splitProgress(onProgress, [1, 3]);
+                await fetcher.loadScript(
+                    jQueryPath,
+                    () => "jQuery" in globalThis,
+                    progs.shift()
+                );
+                await fetcher.loadScript(
+                    `https://${this.host}/libs/lib-jitsi-meet.min.js`,
+                    () => "JitsiMeetJS" in globalThis,
+                    progs.shift()
+                );
                 {
-                    JitsiMeetJS.setLogLevel(JitsiMeetJS.logLevels.ERROR);
+                    JitsiMeetJS.setLogLevel(JitsiMeetJS.logLevels.DEBUG);
                 }
+                console.log("initializing JitsiMeetJS");
                 JitsiMeetJS.init();
                 this.loaded = true;
             }
         }
         createTeleconferenceClient(fetcher, audio) {
             if (!this.loaded) {
-                throw new Error("lib-jitsi-meet has not been loaded. Call clientFactory.load().");
+                throw new Error(
+                    "lib-jitsi-meet has not been loaded. Call clientFactory.load()."
+                );
             }
-            return new JitsiTeleconferenceClient(fetcher, audio, this.host, this.bridgeHost, this.bridgeMUC);
+            return new JitsiTeleconferenceClient(
+                fetcher,
+                audio,
+                this.host,
+                this.bridgeHost,
+                this.bridgeMUC
+            );
         }
     }
 
@@ -8797,7 +8853,7 @@
         }
     }
 
-    const JITSI_HOST = "tele.calla.chat";
+    const JITSI_HOST = "localhost:8443"; // meet.jit.si // works with tele.calla.chat // localhost:8443 // meet.tividoo.com
     const JVB_HOST = JITSI_HOST;
     const JVB_MUC = "conference." + JITSI_HOST;
 
@@ -8818,7 +8874,7 @@
      **/
     function getUserNumber() {
         const testNumber = getTestNumber();
-        return !isNullOrUndefined(testNumber)
+        return isDefined(testNumber)
             ? parseInt(testNumber, 10)
             : 1;
     }

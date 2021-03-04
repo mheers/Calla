@@ -195,7 +195,7 @@ export class LoginForm extends FormDialog<LoginFormEvents> {
         if (v === null
             || v === undefined
             || v.length === 0) {
-            v = this.roomSelect.values[0].ShortName;
+            v = this.roomSelect.values[0]?.ShortName;
         }
 
         this.roomInput.value = v;
